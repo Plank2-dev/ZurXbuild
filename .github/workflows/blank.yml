@@ -1,4 +1,4 @@
-name: Unzip and commit MR_PLANKTON_ZURXBUILD.zip
+name: Unzip and commit MR_PLANKTON_ZURXBUILD_GITHUB_UPLOAD.zip
 
 on:
   workflow_dispatch: {}
