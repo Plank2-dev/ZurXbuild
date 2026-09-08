@@ -1,3 +1,7 @@
-# Build folder and log file
+*.iml
+.gradle
+.idea/
 build/
-build.log
+.dart_tool/
+.flutter-plugins
+.packages
