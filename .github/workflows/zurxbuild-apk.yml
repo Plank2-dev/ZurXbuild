@@ -1,0 +1,118 @@
+name: ZUR X-BUILD APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build mode
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - debug
+      release_tag:
+        description: Temporary source release tag created by ZURXBUILD
+        required: true
+        type: string
+      source_asset:
+        description: ZIP asset name inside the temporary release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_CHANNEL: stable
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download project source from ZURXBUILD release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+        run: |
+          set -euo pipefail
+          rm -rf input-project
+          mkdir -p input-project
+          timeout 300s gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SOURCE_ASSET" \
+            --dir input-project \
+            --clobber
+          test -s "input-project/$SOURCE_ASSET"
+          mkdir -p unpacked
+          unzip -q "input-project/$SOURCE_ASSET" -d unpacked
+          PUBSPEC="$(find unpacked -type f -name pubspec.yaml -print -quit)"
+          test -n "$PUBSPEC"
+          echo "PROJECT_ROOT=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Validate project
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -euo pipefail
+          test -f pubspec.yaml
+          test -f lib/main.dart || echo "Warning: lib/main.dart tidak ditemukan; project mungkin memakai entrypoint custom."
+
+      - name: Dependencies
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          : > build.log
+          if [ "${{ inputs.build_mode }}" = "debug" ]; then
+            timeout --foreground 30m flutter build apk --debug 2>&1 | tee build.log
+            CODE=${PIPESTATUS[0]}
+            echo "APK_PATH=build/app/outputs/flutter-apk/app-debug.apk" >> "$GITHUB_ENV"
+          else
+            timeout --foreground 30m flutter build apk --release 2>&1 | tee build.log
+            CODE=${PIPESTATUS[0]}
+            echo "APK_PATH=build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_ENV"
+          fi
+          if [ "$CODE" -ne 0 ]; then
+            echo "Flutter build gagal dengan exit code $CODE" >&2
+            exit "$CODE"
+          fi
+          test -s "$APK_PATH"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zurxbuild-build-log-${{ github.run_id }}
+          path: ${{ env.PROJECT_ROOT }}/build.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zurxbuild-apk-${{ inputs.build_mode }}-${{ github.run_id }}
+          path: ${{ env.PROJECT_ROOT }}/${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 1
