@@ -1,0 +1,89 @@
+name: Unzip and commit MR.PLANKTON template
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unzip-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find template ZIP
+        id: find_zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=""
+          for candidate in "MR_PLANKTON_ZURXBUILD_GITHUB_UPLOAD.zip" "MR_PLANKTON_ZURXBUILD.zip"; do
+            if [ -f "$candidate" ]; then ZIP="$candidate"; break; fi
+          done
+          if [ -z "$ZIP" ]; then
+            echo "::error::Template ZIP tidak ditemukan di root repository."
+            exit 1
+          fi
+          echo "ZIP=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "Menggunakan: $ZIP"
+
+      - name: Ensure unzip and rsync are available
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip rsync
+
+      - name: Extract template
+        env:
+          ZIP: ${{ steps.find_zip.outputs.ZIP }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
+
+          unzip -q -o "$ZIP" -d "$TMPDIR"
+
+          shopt -s dotglob nullglob
+          entries=("$TMPDIR"/*)
+
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            SOURCE_DIR="${entries[0]}"
+          else
+            SOURCE_DIR="$TMPDIR"
+          fi
+
+          rsync -a --exclude='.git/'             --exclude='.github/workflows/unzip-and-commit.yml'             "$SOURCE_DIR/" ./
+
+      - name: Validate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f pubspec.yaml
+          test -f android/app/build.gradle.kts
+          test -f android/app/src/main/java/com/plankdev/icsa/MainActivity.java
+          echo "Flutter project structure OK."
+
+      - name: Remove uploaded ZIP
+        env:
+          ZIP: ${{ steps.find_zip.outputs.ZIP }}
+        run: rm -f "$ZIP"
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Tidak ada perubahan untuk di-commit."
+            exit 0
+          fi
+          git commit -m "Add MR.PLANKTON Flutter APK template"
+          git push origin HEAD:main
