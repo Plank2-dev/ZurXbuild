@@ -1,0 +1,161 @@
+name: ZUR X-BUILD APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: Build mode
+        required: true
+        default: release
+        type: choice
+        options: [release, debug]
+      source_type:
+        description: Source transport
+        required: true
+        default: telegram
+        type: choice
+        options: [telegram, release]
+      telegram_file_id:
+        description: Telegram file_id (filled automatically by ZURXBUILD)
+        required: false
+        type: string
+      release_tag:
+        description: Temporary source release tag (fallback transport)
+        required: false
+        type: string
+      source_asset:
+        description: ZIP asset name inside the temporary release (fallback transport)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  FLUTTER_CHANNEL: stable
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Fetch project source
+        env:
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          TELEGRAM_FILE_ID: ${{ inputs.telegram_file_id }}
+          TELEGRAM_TOKEN: ${{ secrets.ZURXBUILD_BOT_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf input-project unpacked
+          mkdir -p input-project unpacked
+
+          if [ "$SOURCE_TYPE" = "telegram" ]; then
+            test -n "$TELEGRAM_TOKEN" || { echo "Missing GitHub secret ZURXBUILD_BOT_TOKEN" >&2; exit 1; }
+            test -n "$TELEGRAM_FILE_ID" || { echo "Missing telegram_file_id" >&2; exit 1; }
+            META="$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile" \
+              --data-urlencode "file_id=${TELEGRAM_FILE_ID}")"
+            FILE_PATH="$(printf '%s' "$META" | jq -r '.result.file_path // empty')"
+            test -n "$FILE_PATH" || { echo "Telegram getFile gagal: $(printf '%s' "$META" | jq -r '.description // "unknown error"')" >&2; exit 1; }
+            echo "Telegram file metadata OK."
+            curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 1200 \
+              "https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${FILE_PATH}" \
+              -o input-project/project.zip
+            test -s input-project/project.zip
+            SIZE="$(stat -c%s input-project/project.zip)"
+            if [ "$SIZE" -gt $((20*1024*1024)) ]; then
+              echo "Telegram Cloud API hanya mengizinkan direct download <=20 MB. Gunakan fallback release untuk ZIP yang lebih besar." >&2
+              exit 1
+            fi
+          else
+            test -n "$RELEASE_TAG" || { echo "Missing release_tag" >&2; exit 1; }
+            test -n "$SOURCE_ASSET" || { echo "Missing source_asset" >&2; exit 1; }
+            timeout 300s gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$SOURCE_ASSET" \
+              --dir input-project \
+              --clobber
+            test -s "input-project/$SOURCE_ASSET"
+            cp "input-project/$SOURCE_ASSET" input-project/project.zip
+          fi
+
+          unzip -q input-project/project.zip -d unpacked
+          PUBSPEC="$(find unpacked -type f -name pubspec.yaml -print -quit)"
+          test -n "$PUBSPEC"
+          echo "PROJECT_ROOT=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Validate project
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -euo pipefail
+          test -f pubspec.yaml
+          test -f lib/main.dart || echo "Warning: lib/main.dart tidak ditemukan; project mungkin memakai entrypoint custom."
+
+      - name: Dependencies
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          : > build.log
+          if [ "${{ inputs.build_mode }}" = "debug" ]; then
+            timeout --foreground 30m flutter build apk --debug 2>&1 | tee build.log
+            CODE=${PIPESTATUS[0]}
+            echo "APK_PATH=build/app/outputs/flutter-apk/app-debug.apk" >> "$GITHUB_ENV"
+          else
+            timeout --foreground 30m flutter build apk --release 2>&1 | tee build.log
+            CODE=${PIPESTATUS[0]}
+            echo "APK_PATH=build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_ENV"
+          fi
+          if [ "$CODE" -ne 0 ]; then
+            echo "Flutter build gagal dengan exit code $CODE" >&2
+            exit "$CODE"
+          fi
+          test -s "$APK_PATH"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zurxbuild-build-log-${{ github.run_id }}
+          path: ${{ env.PROJECT_ROOT }}/build.log
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          test -s "${{ env.PROJECT_ROOT }}/${{ env.APK_PATH }}"
+          ls -lh "${{ env.PROJECT_ROOT }}/${{ env.APK_PATH }}"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zurxbuild-apk-${{ inputs.build_mode }}-${{ github.run_id }}
+          path: ${{ env.PROJECT_ROOT }}/${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 1
