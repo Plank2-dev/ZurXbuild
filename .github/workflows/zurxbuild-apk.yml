@@ -1,4 +1,4 @@
-name: ZUR X-BUILD APK
+name: ZUR X-BUILD V12
 
 on:
   workflow_dispatch:
